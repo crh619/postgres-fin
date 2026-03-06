@@ -1,6 +1,6 @@
 # PostgreSQL / TimescaleDB Stack — Technical Specification
 
-**Version 1.2 — March 2026**
+**Version 1.4 — March 2026**
 Internal Infrastructure — Macro Terminal & MTM
 
 > Reproducible · Safe · Single-Operator Maintainable
@@ -16,6 +16,8 @@ Internal Infrastructure — Macro Terminal & MTM
 | 1.2 | 2026-03-06 | Networking fix (no host port exposure), init script fix (shell wrapper for env vars), Dockerfile corrections (add pgBackRest, drop unused extensions), remove soma (separate stack), add MTM migration section, add `pg_cron` to extensions section, pin base image version |
 | 1.2.1 | 2026-03-06 | App users own their databases + public schema, backup_user explicit CONNECT/auth, pgBackRest restore procedure rewritten (restore container), WAL max_wal_size claim corrected, health check validates both DB dumps individually, pg_cron availability note clarified |
 | 1.2.2 | 2026-03-06 | Explicit volume name (`postgres_data`) for copy-paste reliable restore commands, simplified restore image reference, removed misleading `depends_on` snippets (cross-project — apps must use wait-for-Postgres in entrypoint), added Section 10.1 backup script conventions (`set -euo pipefail`, retention after success, per-DB logging) |
+| 1.3 | 2026-03-06 | Directory rename `postgres/` → `postgres-fin/`, added `pg_hba.conf` content, added pgBackRest `stanza-create` step, added `archive_timeout`, fixed `backup_user` dump command (missing `PGPASSWORD`), added `logs/` directory creation note |
+| 1.4 | 2026-03-06 | Implementation fixes: Alpine base image (`apk` not `apt-get`), pgBackRest dir permissions in Dockerfile, `compress-type=gz` (Alpine pgbackrest lacks zstd), `pg1-user=postgres` in pgbackrest.conf, `pg_hba.conf` local trust for all users (pgBackRest runs as root), pgBackRest commands must run as `postgres` OS user |
 
 ---
 
@@ -96,13 +98,13 @@ All applications connect to the same server but different databases over the `la
 All database infrastructure resides under:
 
 ```
-/opt/docker/postgres
+/opt/docker/postgres-fin
 ```
 
 Directory structure:
 
 ```
-/opt/docker/postgres/
+/opt/docker/postgres-fin/
 ├── docker-compose.yml
 ├── Dockerfile
 ├── .env                          # passwords, not tracked in git
@@ -160,9 +162,10 @@ TimescaleDB already includes PostgreSQL, Timescale extensions, and hypertable su
 FROM timescale/timescaledb:2.17.2-pg16
 
 # pgBackRest for physical backups + WAL archiving
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    pgbackrest \
-    && rm -rf /var/lib/apt/lists/*
+# Note: Alpine-based image — use apk, not apt-get
+RUN apk add --no-cache pgbackrest \
+    && mkdir -p /var/log/pgbackrest /tmp/pgbackrest \
+    && chown -R postgres:postgres /var/log/pgbackrest /tmp/pgbackrest
 
 # Custom config
 COPY config/postgresql.conf /etc/postgresql/postgresql.conf
@@ -174,6 +177,8 @@ COPY scripts/01-init-databases.sh /docker-entrypoint-initdb.d/
 # Enable data checksums to detect silent on-disk corruption
 ENV POSTGRES_INITDB_ARGS="--data-checksums"
 ```
+
+> **v1.4 change:** The TimescaleDB image is Alpine-based, not Debian. Package installation uses `apk add` instead of `apt-get`. The Dockerfile also creates `/var/log/pgbackrest` and `/tmp/pgbackrest` owned by `postgres:postgres` — pgBackRest needs these directories for logging and lock files when run as the `postgres` user.
 
 > **v1.2 change — extensions removed from Dockerfile:**
 >
@@ -191,7 +196,7 @@ Without checksums, PostgreSQL can silently serve corrupted pages from disk. With
 
 ## 6. Docker Compose Configuration
 
-File: `/opt/docker/postgres/docker-compose.yml`
+File: `/opt/docker/postgres-fin/docker-compose.yml`
 
 ```yaml
 services:
@@ -364,6 +369,7 @@ Intentional WAL configuration is critical on a VPS. Uncontrolled WAL growth is t
 wal_level = replica
 archive_mode = on
 archive_command = 'pgbackrest --stanza=main archive-push %p'
+archive_timeout = 300
 
 # WAL size bounds — prevent unbounded growth
 max_wal_size = 4GB
@@ -378,6 +384,19 @@ max_connections = 100
 
 > **Disk exhaustion risk:** If WAL archiving silently fails (network issue, pgBackRest misconfiguration), WAL files pile up in `/var/lib/postgresql/data/pg_wal/` until the disk is full. PostgreSQL then stops accepting writes.
 >
+### config/pg_hba.conf
+
+```
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     trust
+host    all             all             0.0.0.0/0               scram-sha-256
+host    all             all             ::/0                    scram-sha-256
+```
+
+Local trust for all users allows `docker exec psql -U postgres` without a password (standard for container admin) and lets pgBackRest connect locally to verify the cluster state. All network connections require password authentication (`scram-sha-256`).
+
+> **v1.4 change:** Changed `local all postgres trust` to `local all all trust`. pgBackRest runs as the `root` OS user inside the container and connects via the local Unix socket. With user-restricted trust, pgBackRest's `stanza-create` and `archive-push` commands fail with `no pg_hba.conf entry for user "root"`. Since no ports are exposed to the host, local trust for all users carries no additional risk.
+
 > `max_wal_size` controls checkpoint frequency and **helps** manage normal WAL growth, but it is **not a hard ceiling** — if archiving breaks and WAL segments cannot be recycled, they will accumulate beyond this value. `max_wal_size` alone does not guarantee protection from disk exhaustion. The health monitoring script (Section 17) and disk usage alerts are the actual safety net for this failure mode.
 
 ---
@@ -399,7 +418,7 @@ docker exec -e PGPASSWORD="$BACKUP_PASSWORD" postgres-fin \
     pg_dump -Fc -U backup_user mtm   > backups/dumps/mtm_$(date +%Y%m%d).dump
 ```
 
-Stored in `/opt/docker/postgres/backups/dumps/` with 14-day retention.
+Stored in `/opt/docker/postgres-fin/backups/dumps/` with 14-day retention.
 
 > **Credential handling for noninteractive dumps:** The backup scripts must supply credentials without human interaction. Three options exist:
 >
@@ -407,7 +426,7 @@ Stored in `/opt/docker/postgres/backups/dumps/` with 14-day retention.
 > 2. **`.pgpass` file** inside the container — more secure for long-running sidecar setups.
 > 3. **`trust` auth for `backup_user` in `pg_hba.conf`** — only safe if the container network is fully isolated (it is, since no host port is exposed).
 >
-> Option 1 is recommended for this stack. The `BACKUP_PASSWORD` value should be sourced from `/opt/docker/postgres/.env` in the backup shell script.
+> Option 1 is recommended for this stack. The `BACKUP_PASSWORD` value should be sourced from `/opt/docker/postgres-fin/.env` in the backup shell script.
 
 ### Layer 2: Physical Backups (pgBackRest)
 
@@ -425,11 +444,14 @@ repo1-retention-diff=7
 
 # Performance options
 start-fast=y
-compress-type=zst
+compress-type=gz
 
 [main]
 pg1-path=/var/lib/postgresql/data
+pg1-user=postgres
 ```
+
+> **v1.4 change:** `compress-type` changed from `zst` to `gz` — Alpine's pgbackrest package is not built with zstd support. Added `pg1-user=postgres` so pgBackRest connects to Postgres as the `postgres` role instead of the OS user (`root`).
 
 ### Backup Schedule
 
@@ -441,6 +463,18 @@ pg1-path=/var/lib/postgresql/data
 | Retention: full cycles | 3 |
 | Retention: incremental | 7 days |
 
+### First-time setup: stanza-create
+
+After the container starts for the first time, initialize the pgBackRest stanza before running any backups:
+
+```bash
+docker exec postgres-fin su -s /bin/sh postgres -c "pgbackrest --stanza=main stanza-create"
+```
+
+This must run **once** before the first backup and before `archive_command` can succeed.
+
+> **v1.4 change:** pgBackRest commands must run as the `postgres` OS user via `su -s /bin/sh postgres -c "..."`. Running as `root` fails because the `root` PostgreSQL role does not exist. The `archive_command` in `postgresql.conf` already runs as `postgres` (the Postgres server user), so WAL archiving works without modification. Without it, WAL archiving will fail silently and segments will accumulate in `pg_wal/`.
+
 > **Why explicit retention is required:** If `pgbackrest.conf` does not define retention, backups accumulate until the VPS disk is full. `repo1-retention-full=3` keeps three full backup cycles and automatically expires older ones. Leaving retention undefined is a configuration error, not a safe default.
 
 ### Layer 3: Offsite Backups (rclone)
@@ -448,7 +482,7 @@ pg1-path=/var/lib/postgresql/data
 Backups are synced to remote object storage to protect against VPS loss, disk failure, and provider outage.
 
 ```bash
-rclone sync /opt/docker/postgres/backups remote:postgres-backups
+rclone sync /opt/docker/postgres-fin/backups remote:postgres-backups
 ```
 
 Target: Backblaze B2 or S3-compatible storage with an encrypted remote bucket.
@@ -458,7 +492,7 @@ Target: Backblaze B2 or S3-compatible storage with an encrypted remote bucket.
 All backup scripts (`backup-dump.sh`, `backup-rclone.sh`) must follow these rules:
 
 1. **`set -euo pipefail`** at the top of every script. A silent failure in a backup pipeline is worse than a loud crash.
-2. **Source `.env` carefully.** Use `source /opt/docker/postgres/.env` or `export $(grep -v '^#' .env | xargs)`. Never hardcode passwords.
+2. **Source `.env` carefully.** Use `source /opt/docker/postgres-fin/.env` or `export $(grep -v '^#' .env | xargs)`. Never hardcode passwords.
 3. **Dump filenames must include database name and date:** `macro_20260306.dump`, `mtm_20260306.dump`. This is required for the per-database health check (Section 17) to validate freshness.
 4. **Retention cleanup happens after successful backup creation, not before.** If the new dump fails, the old one must still exist. Pattern: dump → verify file exists and is non-empty → delete dumps older than 14 days.
 5. **Log success/failure per database.** A script that exits 0 after backing up one DB but silently skipping the other is a bug. Log each DB outcome and exit non-zero if any failed.
@@ -505,7 +539,7 @@ Used for disk corruption and complete database cluster loss.
 
 ```bash
 # 1. Stop PostgreSQL
-docker compose -f /opt/docker/postgres/docker-compose.yml down
+docker compose -f /opt/docker/postgres-fin/docker-compose.yml down
 
 # 2. Clear the corrupted data directory (pgBackRest needs an empty target).
 #    The volume still exists after 'down' — we run a temporary container to wipe it.
@@ -517,12 +551,12 @@ docker run --rm \
 #    and the same volumes (data + backups + config).
 #
 #    Replace <IMAGE> with the built image name. Find it with:
-#      docker compose -f /opt/docker/postgres/docker-compose.yml images
-#    It will be something like 'postgres-postgres' or whatever Compose named it.
+#      docker compose -f /opt/docker/postgres-fin/docker-compose.yml images
+#    It will be something like 'postgres-fin-postgres' or whatever Compose named it.
 docker run --rm \
     -v postgres_data:/var/lib/postgresql/data \
-    -v /opt/docker/postgres/backups:/backups \
-    -v /opt/docker/postgres/config/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro \
+    -v /opt/docker/postgres-fin/backups:/backups \
+    -v /opt/docker/postgres-fin/config/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro \
     <IMAGE> \
     pgbackrest --stanza=main restore
 
@@ -530,7 +564,7 @@ docker run --rm \
 #    and set recovery_target_time in postgresql.conf before starting.
 
 # 5. Start PostgreSQL — it will replay WAL to the recovery point.
-docker compose -f /opt/docker/postgres/docker-compose.yml up -d
+docker compose -f /opt/docker/postgres-fin/docker-compose.yml up -d
 ```
 
 > **Why a one-off container:** pgBackRest restores files into the data directory while Postgres is not running. Since the Postgres container's entrypoint starts the server, we use a plain `docker run` with the same image to execute just the restore command. The one-off container exits after restore completes, then the normal `docker compose up` starts the server against the restored data.
@@ -565,7 +599,7 @@ Tools like Syncthing must not sync the live data directory (`/var/lib/postgresql
 ### Always take a dump before migrations
 
 ```bash
-docker exec postgres-fin pg_dump -Fc -U backup_user mtm > backup_before_migration_$(date +%Y%m%d).dump
+docker exec -e PGPASSWORD="$BACKUP_PASSWORD" postgres-fin pg_dump -Fc -U backup_user mtm > backup_before_migration_$(date +%Y%m%d).dump
 ```
 
 ### Separate users per project
@@ -627,12 +661,12 @@ A daily health check script provides early warning of the two most common single
 # health-check.sh — daily status check for PostgreSQL stack
 # Run via cron at 05:00, after the backup pipeline completes
 
-LOGFILE="/opt/docker/postgres/logs/health-$(date +%Y%m%d).log"
+LOGFILE="/opt/docker/postgres-fin/logs/health-$(date +%Y%m%d).log"
 STATUS="OK"
 WARNINGS=""
 
 # 1. Disk usage check
-DISK_PCT=$(df /opt/docker/postgres | awk 'NR==2 {print $5}' | tr -d '%')
+DISK_PCT=$(df /opt/docker/postgres-fin | awk 'NR==2 {print $5}' | tr -d '%')
 if [ "$DISK_PCT" -gt 80 ]; then
     STATUS="WARN"
     WARNINGS="$WARNINGS | disk_usage=${DISK_PCT}%"
@@ -640,7 +674,7 @@ fi
 
 # 2. Per-database dump freshness (each DB must have a dump within last 24h)
 for db in macro mtm; do
-    DB_DUMP=$(find /opt/docker/postgres/backups/dumps -name "${db}_*.dump" -mtime -1 | wc -l)
+    DB_DUMP=$(find /opt/docker/postgres-fin/backups/dumps -name "${db}_*.dump" -mtime -1 | wc -l)
     if [ "$DB_DUMP" -eq 0 ]; then
         STATUS="WARN"
         WARNINGS="$WARNINGS | no_recent_dump_${db}"
@@ -655,7 +689,7 @@ if [ "$PGBR_STATUS" -eq 0 ]; then
 fi
 
 # 4. Backup storage size
-BACKUP_SIZE=$(du -sh /opt/docker/postgres/backups | awk '{print $1}')
+BACKUP_SIZE=$(du -sh /opt/docker/postgres-fin/backups | awk '{print $1}')
 
 # 5. Postgres container health
 PG_HEALTHY=$(docker inspect --format='{{.State.Health.Status}}' postgres-fin 2>/dev/null)
@@ -671,10 +705,18 @@ echo "{\"ts\":\"$(date -Iseconds)\",\"status\":\"$STATUS\",\"disk_pct\":$DISK_PC
 [ "$STATUS" = "OK" ] && exit 0 || exit 1
 ```
 
+### Prerequisites
+
+Create the logs directory before the first health check run:
+
+```bash
+mkdir -p /opt/docker/postgres-fin/logs
+```
+
 ### Cron entry
 
 ```
-0 5 * * * /opt/docker/postgres/scripts/health-check.sh
+0 5 * * * /opt/docker/postgres-fin/scripts/health-check.sh
 ```
 
 ### What this catches
@@ -709,13 +751,13 @@ This section describes how to move MTM from its current embedded Postgres (`mtmd
 
 ```bash
 docker compose -f /opt/docker/mtm-dev/docker-compose.yml exec -T db \
-    pg_dump -Fc -U mtm_user mtm_dev > /opt/docker/postgres/backups/dumps/mtm_pre_migration.dump
+    pg_dump -Fc -U mtm_user mtm_dev > /opt/docker/postgres-fin/backups/dumps/mtm_pre_migration.dump
 ```
 
 **Step 2: Start the shared Postgres stack**
 
 ```bash
-cd /opt/docker/postgres
+cd /opt/docker/postgres-fin
 docker compose up -d
 # Wait for healthy status
 docker compose ps
@@ -727,7 +769,7 @@ The init script creates the `mtm` database, `mtm_user`, and enables extensions a
 
 ```bash
 docker exec -i postgres-fin pg_restore -U postgres --no-owner --no-acl -d mtm \
-    < /opt/docker/postgres/backups/dumps/mtm_pre_migration.dump
+    < /opt/docker/postgres-fin/backups/dumps/mtm_pre_migration.dump
 ```
 
 `--no-owner --no-acl` ensures objects are created owned by the restoring user and existing grants are applied cleanly.

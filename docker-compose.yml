@@ -1,0 +1,30 @@
+services:
+  postgres:
+    build: .
+    container_name: postgres-fin
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./config/pgbackrest.conf:/etc/pgbackrest/pgbackrest.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    networks:
+      - lalonet_private
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+volumes:
+  postgres_data:
+    name: postgres_data   # Explicit name — prevents Compose project prefix.
+                          # Restore commands can reference 'postgres_data' directly
+                          # regardless of COMPOSE_PROJECT_NAME or directory name.
+
+networks:
+  lalonet_private:
+    external: true

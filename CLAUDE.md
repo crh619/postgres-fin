@@ -32,8 +32,8 @@ docker exec -e PGPASSWORD="$BACKUP_PASSWORD" postgres-fin pg_dump -Fc -U backup_
 # Restore a dump
 docker exec -i postgres-fin pg_restore -U postgres -d macro < backups/dumps/macro_YYYYMMDD.dump
 
-# pgBackRest status
-docker exec postgres-fin pgbackrest info --stanza=main
+# pgBackRest status (must run as postgres user)
+docker exec postgres-fin su -s /bin/sh postgres -c "pgbackrest info --stanza=main"
 
 # Health check
 ./scripts/health-check.sh
@@ -73,6 +73,24 @@ Cron pipeline: 02:00 dumps, 03:00 pgBackRest, 04:00 rclone, 05:00 health check.
 - WAL archiving failure can cause disk exhaustion even with `max_wal_size` set — it's not a hard ceiling. The health check script monitors this.
 - Data checksums are enabled (`--data-checksums`) to detect silent disk corruption.
 
+## Alpine Base Image
+
+The TimescaleDB image is Alpine-based (not Debian). Packages are installed with `apk`, not `apt-get`. Alpine's pgbackrest package lacks zstd support — use `compress-type=gz` in pgbackrest.conf.
+
+## pgBackRest Operations
+
+pgBackRest commands must run as the `postgres` OS user (not `root`):
+
+```bash
+# All pgbackrest commands inside the container
+docker exec postgres-fin su -s /bin/sh postgres -c "pgbackrest --stanza=main <command>"
+
+# First-time stanza init (after first container start)
+docker exec postgres-fin su -s /bin/sh postgres -c "pgbackrest --stanza=main stanza-create"
+```
+
+The Dockerfile creates `/var/log/pgbackrest` and `/tmp/pgbackrest` owned by `postgres:postgres` for logs and lock files. The `pg_hba.conf` uses `local all all trust` so pgBackRest (running as any local user) can connect to verify the cluster.
+
 ## Full Spec
 
-See `postgres_spec_v1.2.md` for complete details including restore procedures, MTM migration plan, upgrade strategy, and networking reference.
+See `postgres_spec_v1.2.md` (current version: 1.4) for complete details including restore procedures, MTM migration plan, upgrade strategy, and networking reference.
